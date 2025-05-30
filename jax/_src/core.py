@@ -1536,6 +1536,10 @@ class AbstractValue:
   def str_short(self, short_dtypes=False):
     return str(self)
 
+  # subclass this for types with non-trivial quasi-dynamic data
+  def get_qdd(self, val):
+    return None
+
 # For type signatures involving dynamic shapes, we use lists of abstract values
 # which may contain (reverse) de Bruijn indices in their shapes.
 class DBIdx(NamedTuple):
@@ -1703,6 +1707,25 @@ def concrete_dim_or_error(val: Any, context=""):
     return val
   else:
     return concrete_or_error(operator.index, val, context=context)
+
+### Quasi-dynamic data
+
+# Quasi-dynamic data includes things like liveness bits and the content type of
+# a type-changeable box. These change throughout the program but at a given
+# point in the program they have a single statically known value.
+
+class QuasiDynamicData:
+  pass
+
+@dataclass(frozen=True)
+class AvalQDD:
+  aval: AbstractValue
+  qdd: QuasiDynamicData
+
+def get_qdd(x):
+  ty = typeof(x)
+  return ty.get_qdd(x)
+
 
 ### Extended dtypes
 #

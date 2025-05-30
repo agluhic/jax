@@ -222,7 +222,7 @@ def box_set(box, val):
   box_set_p.bind(box, *leaves, treedef=treedef)
 
 @dataclass(frozen=True)
-class BoxTypeState:
+class BoxTypeState(core.QuasiDynamicData):
   leaf_avals: tuple[core.AbstractValue, ...]
   treedef: PyTreeDef
 
@@ -247,6 +247,9 @@ class BoxTy(core.AbstractValue):
 
   def str_short(self, short_dtypes=False):
     return 'BoxTy'
+
+  def get_qdd(self, box):
+    return box.type_state()
 
   # mutable interface
   def lo_ty_(self, box_state):
@@ -374,6 +377,23 @@ box_get_p = BoxGet('box_get')
 
 
 class BoxTest(jtu.JaxTestCase):
+
+  @parameterized.parameters([False, True])
+  def test_qdd(self, jit):
+
+    val1 = 1.0
+    val2 = jnp.arange(3)
+
+    def f(box):
+      assert core.get_qdd(box).leaf_avals == (core.typeof(val1),)
+      box.set(val2)
+      assert core.get_qdd(box).leaf_avals == (core.typeof(val2),)
+      return
+
+    if jit:
+      f = jax.jit(f)
+
+    f(Box(val1))
 
   def test_jit_arg(self):
     @jax.jit
