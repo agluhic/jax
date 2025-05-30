@@ -235,7 +235,7 @@ class BoxTypeState(core.QuasiDynamicData):
                         self.treedef)
 
 class BoxTy(core.AbstractValue):
-  mutable = True
+  has_qdd = True
 
   # forwarded to value
   get = core.aval_method(box_get)
@@ -249,10 +249,15 @@ class BoxTy(core.AbstractValue):
     return 'BoxTy'
 
   def get_qdd(self, box):
-    return box.type_state()
+    if isinstance(box, Box):
+      return box.type_state()
+    elif isinstance(box, core.Tracer):
+      return box.mutable_qdd.cur_val
+    else:
+      raise TypeError
 
   # mutable interface
-  def lo_ty_(self, box_state):
+  def lo_ty(self, box_state):
     return [lo_ty for t in box_state.leaf_avals for lo_ty in t.lo_ty()]
 
   def new_from_loval(self, box_state: BoxTypeState, *lo_vals):
@@ -328,14 +333,8 @@ class BoxSet(HiPrimitive):
 
   def is_high(self, *, treedef) -> bool: return True
 
-  def staging(self, trace, box_tracer, *leaves, treedef):
-    super().staging(trace, box_tracer, *leaves, treedef=treedef)
-    var = trace.getvar(box_tracer)
-    avals = tuple(t.aval for t in leaves)
-    trace.frame.current_typechange_env[var] = BoxTypeState(avals, treedef)
-    return []
-
   def abstract_eval(self, box_ty, *leaf_avals, treedef):
+    box_ty.mutable_qdd.update(BoxTypeState(leaf_avals, treedef))
     return [], set()  # TODO better typechecking...
 
   def to_lojax(_, box, *leaves, treedef):
@@ -384,11 +383,22 @@ class BoxTest(jtu.JaxTestCase):
     val1 = 1.0
     val2 = jnp.arange(3)
 
-    def f(box):
-      assert core.get_qdd(box).leaf_avals == (core.typeof(val1),)
-      box.set(val2)
-      assert core.get_qdd(box).leaf_avals == (core.typeof(val2),)
-      return
+    box1 = Box(val2)
+
+    def f(box2):
+      assert core.get_qdd(box2).leaf_avals == (core.typeof(val1),)
+      box2.set(val2)
+      assert core.get_qdd(box2).leaf_avals == (core.typeof(val2),)
+
+      # box3 = Box(val3)
+      # assert core.get_qdd(box3).leaf_avals == (core.typeof(val2),)
+      # box3.set(val1)
+      # assert core.get_qdd(box3).leaf_avals == (core.typeof(val1),)
+
+      # assert core.get_qdd(box1).leaf_avals == (core.typeof(val1),)
+      # box1.set(val2)
+      # assert core.get_qdd(box1).leaf_avals == (core.typeof(val2),)
+      # # return
 
     if jit:
       f = jax.jit(f)
@@ -694,7 +704,7 @@ class BoxTest(jtu.JaxTestCase):
 
     @dataclass(frozen=True)
     class MyTy(core.AbstractValue):
-      mutable = False
+      has_qdd = True
 
       def to_tangent_aval(self):
         return MyTy()
@@ -731,7 +741,7 @@ class BoxTest(jtu.JaxTestCase):
 
 
 class ListTy(core.AbstractValue):
-  mutable = True
+  has_qdd = True
 
   # forwarded to value
   get = core.aval_method(box_get)
