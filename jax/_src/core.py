@@ -440,6 +440,8 @@ class Var:
   count: int
   suffix: str
   aval: AbstractValue
+  # these are only useful for jaxpr binders but rather than create a separate
+  # type for those, breaking existing interpreters, we add fields here.
   initial_qdd : QuasiDynamicData | None
   final_qdd : QuasiDynamicData | None
 
@@ -1692,7 +1694,7 @@ def concrete_dim_or_error(val: Any, context=""):
 class MutableQuasiDynamicData:
   def __init__(self, val : QuasiDynamicData | None):
     self.init_val = val
-    self.cur_val = val
+    self.cur_val = val  # immutable payload
 
   def update(self, val):
     self.cur_val = val
@@ -1703,7 +1705,7 @@ class QuasiDynamicData:
 @dataclass(frozen=True)
 class AvalQDD:
   aval: AbstractValue
-  qdd: QuasiDynamicData
+  qdd: QuasiDynamicData  # immutable
 
   has_qdd = True
   def lo_ty(self):
@@ -3050,7 +3052,7 @@ def _check_jaxpr(
 
       # Check out_type matches the let-binders' annotation (after substitution).
       out_type = substitute_vars_in_output_ty(out_type, eqn.invars, eqn.outvars)
-      out_type = [AvalQDD(t, None) for t in out_type]  # TODO: handle result qdds
+      out_type = [t if isinstance(t, AvalQDD) else AvalQDD(t, None) for t in out_type]
       foreach(write, eqn.outvars, out_type)
 
     except JaxprTypeError as e:

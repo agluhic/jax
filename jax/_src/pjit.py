@@ -1581,9 +1581,11 @@ def _to_lojax(*hi_args, jaxpr, **params):
   # collect and apply mutations
   out_mut_ = iter(out_mut)
   in_idx = {v: i for i, v in enumerate(jaxpr.jaxpr.invars)}
-  for var, ty in jaxpr.jaxpr.final_typechange_env.items():
-    lo_vals = it.islice(out_mut_, len(var.aval.lo_ty_(ty)))
-    var.aval.update_from_loval(ty, hi_args[in_idx[var]], *lo_vals)
+  for v in jaxpr.jaxpr.invars:
+    if v.final_qdd is not None:
+      qdd = v.final_qdd
+      lo_vals = it.islice(out_mut_, len(v.aval.lo_ty(qdd)))
+      v.aval.update_from_loval(qdd, hi_args[in_idx[v]], *lo_vals)
   assert next(out_mut_, None) is None
 
   # collect output values into hi types

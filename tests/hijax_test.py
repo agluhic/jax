@@ -307,15 +307,10 @@ core.pytype_aval_mappings[Box] = lambda b: b.ty
 class NewBox(HiPrimitive):
   def is_high(self, *, treedef) -> bool: return True
 
-  def staging(self, trace, *, treedef):
-    tracer = super().staging(trace, treedef=treedef)
-    var = trace.frame.tracer_to_var[id(tracer)]
-    leaves, treedef = jax.tree.flatten(None)
-    trace.frame.current_typechange_env[var] = BoxTypeState(leaves, treedef)
-    return tracer
-
   def abstract_eval(self, *, treedef):
-    return BoxTy(), set()
+    leaves, treedef = jax.tree.flatten(None)
+    qdd = BoxTypeState(leaves, treedef)
+    return core.AvalQDD(BoxTy(), qdd), set()
 
   def to_lojax(_, *, treedef):
     return Box(None)
@@ -390,10 +385,11 @@ class BoxTest(jtu.JaxTestCase):
       box2.set(val2)
       assert core.get_qdd(box2).leaf_avals == (core.typeof(val2),)
 
-      # box3 = Box(val3)
-      # assert core.get_qdd(box3).leaf_avals == (core.typeof(val2),)
-      # box3.set(val1)
-      # assert core.get_qdd(box3).leaf_avals == (core.typeof(val1),)
+      box3 = new_box()
+      box3.set(val2)
+      assert core.get_qdd(box3).leaf_avals == (core.typeof(val2),)
+      box3.set(val1)
+      assert core.get_qdd(box3).leaf_avals == (core.typeof(val1),)
 
       # assert core.get_qdd(box1).leaf_avals == (core.typeof(val1),)
       # box1.set(val2)

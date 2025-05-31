@@ -1637,9 +1637,12 @@ class DynamicJaxprTracer(core.Tracer):
   __slots__ = ['aval', 'mutable_qdd', '_debug_info']
 
   def __init__(self, trace: DynamicJaxprTrace,
-               aval: core.AbstractValue,
-               qdd: core.QuasiDynamicData | None = None,
+               aval: core.AbstractValue | core.AvalQDD,
                line_info: source_info_util.SourceInfo | None = None):
+    if isinstance(aval, core.AvalQDD):
+      aval, qdd = aval.aval, aval.qdd
+    else:
+      qdd = None
     self._trace = trace
     self._line_info = line_info
     self._debug_info = self._trace.frame.debug_info  # for UnexpectedTracerError
@@ -1834,7 +1837,10 @@ class JaxprStackFrame:
                    for d in aval.shape]
       new_shape = [d.val if isinstance(d, Literal) else d for d in new_shape]
       aval = aval.update(shape=tuple(new_shape))
-    return self.gensym(aval, initial_qdd=qdd)
+    if isinstance(aval, core.AvalQDD):
+       return self.gensym(aval.aval, initial_qdd=aval.qdd)
+    else:
+       return self.gensym(aval)
 
   def find_progenitors(self, tracer):
     var = self.tracer_to_var.get(id(tracer))
@@ -1917,10 +1923,10 @@ class DynamicJaxprTrace(core.Trace):
     else:
       return x
 
-  def new_arg(self, aval, qdd, source_info: SourceInfo):
-    tracer = DynamicJaxprTracer(self, aval, qdd, source_info)
+  def new_arg(self, aval, source_info: SourceInfo):
+    tracer = DynamicJaxprTracer(self, aval, source_info)
     self.frame.tracers.append(tracer)
-    self.frame.tracer_to_var[id(tracer)] = var = self.frame.newvar(aval, qdd)
+    self.frame.tracer_to_var[id(tracer)] = var = self.frame.newvar(aval)
     self.frame.invars.append(var)
     self.frame.mutable_qdd.append(tracer.mutable_qdd)
     return tracer
@@ -2553,10 +2559,7 @@ def _input_type_to_tracers(
     return a
 
   for a in in_avals:
-    if isinstance(a, core.AvalQDD):
-      in_tracers.append(new_arg(a.aval, a.qdd))
-    else:
-      in_tracers.append(new_arg(_substitute_tracers_in_aval(a), None))
+    in_tracers.append(new_arg(_substitute_tracers_in_aval(a)))
   return in_tracers
 
 def _substitute_vars_in_type(
