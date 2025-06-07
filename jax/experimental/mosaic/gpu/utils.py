@@ -275,7 +275,7 @@ class ThreadSubset(enum.IntEnum):
   BLOCK = enum.auto()
 
 
-# True withon `once()` contexts.
+# True within `once()` contexts.
 _ONCE_PER: ThreadSubset | None = None
 
 
@@ -468,7 +468,7 @@ def _reshape(ref: ir.Value, sh0: list[int], sh1: list[int]):
         # TODO(cperivol): Implement dependent fold-unfolds for subsections
         # of the shape eg (..., 4,5,5, ...) -> (..., 10,10, ...) could be
         # supported without touching any other dimensions.
-        raise NotImplementedError(f"Can't reshape {sh0} to {sh1} bu composing independent folds/unfolds.")
+        raise NotImplementedError(f"Can't reshape {sh0} to {sh1} by composing independent folds/unfolds.")
 
     raise AssertionError(f"Unreachable: number of elements don't match in each shape ({sh0} ans {sh1})")
 
@@ -1398,7 +1398,7 @@ def shfl_bfly(x: ir.Value, distance: int | ir.Value):
   )
   if (x_bitwidth := bitwidth(result_type)) < 32:
     bits_ty = ir.IntegerType.get_signless(x_bitwidth)
-    y_vec = bitcast(y, ir.VectorType.get((32 // x_bitwidth,), x.type))
+    y_vec = bitcast(y, ir.VectorType.get((32 // x_bitwidth,), bits_ty))
     y = vector.extractelement(y_vec, position=c(0, index))
   return bitcast(y, result_type)
 

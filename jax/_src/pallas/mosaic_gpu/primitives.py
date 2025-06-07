@@ -115,7 +115,12 @@ def _load_p_lowering_rule(
             val, shape=(), layout=layout, is_signed=is_signed
         )
       match layout:
-        case mgpu.WGMMA_ROW_LAYOUT | mgpu.WGMMA_COL_LAYOUT:
+        case (
+            mgpu.WGMMA_ROW_LAYOUT
+            | mgpu.WGMMA_COL_LAYOUT
+            | mgpu.TCGEN05_ROW_LAYOUT
+            | mgpu.TCGEN05_COL_LAYOUT
+        ):
           return mgpu.FragmentedArray.load_untiled(
               x_ref,
               is_signed=is_signed,
@@ -482,6 +487,7 @@ def _copy_gmem_to_smem_lowering(
     dst_transforms_treedef,
     barrier_transforms_treedef,
     collective_axes,
+    partitioned_axis,
     for_warpgroup: bool = True,
 ):
   flat_src_transforms, flat_dst_transforms, flat_barrier_transforms = (
@@ -530,6 +536,10 @@ def _copy_gmem_to_smem_lowering(
       # arrive with the whole transfer size, while everyone else arrives with 0.
       # But we should continue using this scheme as it's likely to be faster.
       bytes //= WARPGROUP_SIZE
+      if collective and partitioned_axis is not None:
+        raise NotImplementedError(
+            "Collective partitioned copies not implemented."
+        )
       if ctx.module_ctx.auto_barriers:
         mgpu.warpgroup_barrier()  # Make sure all reads have completed.
       barrier.arrive_expect_tx(bytes)
@@ -537,9 +547,32 @@ def _copy_gmem_to_smem_lowering(
       # In Warp-level lowering, we arrive on each CUDA thread in a warp, but
       # the barrier still expects a full 128 arrivals so we arrive 4 times
       # on each CUDA thread instead.
-      bytes //= WARP_SIZE
-      barrier.arrive(arrival_count=3, can_complete=False)
-      barrier.arrive_expect_tx(bytes)
+      # TODO(justinfu): The arrival counts are wrong if called outside of a
+      # single warp. Figure out how to guard against this in user code.
+      bytes = bytes // WARP_SIZE
+      if collective and partitioned_axis is not None:
+        if len(collective) != 1:
+          raise ValueError(
+              f"Expected exactly one collective axis, got {collective_axes=}"
+          )
+        if math.prod(ctx.launch_ctx.cluster_size) != 2:
+          raise NotImplementedError(
+              "Partitioned loads only supported for clusters of size 2"
+          )
+        # Bytes is the destination size, which is only half of the total
+        # size of the partitioned transfer so we need to double it.
+        bytes *= 2
+        first_block = arith_dialect.cmpi(
+            arith_dialect.CmpIPredicate.eq,
+            ctx.launch_ctx.cluster_idx(collective[0]),
+            mgpu.c(0, ir.IndexType.get()),
+        )
+        with mgpu.when(first_block):
+          barrier.arrive(arrival_count=3, can_complete=False)
+          barrier.arrive_expect_tx(bytes)
+      else:
+        barrier.arrive(arrival_count=3, can_complete=False)
+        barrier.arrive_expect_tx(bytes)
 
     ctx.launch_ctx.async_copy(
         src_ref=src,
@@ -548,6 +581,7 @@ def _copy_gmem_to_smem_lowering(
         arrive=False,
         predicate=ctx.module_ctx.single_lane_predicate,
         collective=collective,
+        partitioned=partitioned_axis,
         **copy_params,
     )
     return ()
@@ -590,8 +624,32 @@ def copy_gmem_to_smem(
     barrier: _Ref,
     *,
     collective_axes: str | tuple[str, ...] | None = None,
+    partitioned_axis: int | None = None,
 ) -> None:
   """Asynchronously copies a GMEM reference to a SMEM reference.
+
+  If collective_axes is specified, this performs a multicast copy where
+  all CUDA blocks that share the same index along the collective axis
+  receive a copy of the same block of data loaded from `dst` to `src`.
+
+  If both collective_axes and partitioned_axis are specified, this will perform
+  a partitioned collective copy where each block in the cluster will receive
+  a tile of `transfer_size // cluster_size` data from the `src` Ref.
+  For example, if `src` has a shape of (256, 256) and a partitioned
+  copy is performed along axis 0 with cluster size 2, then the first block will
+  receive `src[0:128, :]` and the second will receive `src[128:256, :]`.
+  NOTE: Only the first block in the cluster will arrive on the barrier,
+  and an additional cluster barrier is necessary to ensure that all blocks in
+  the cluster have finished the copy.
+
+  Args:
+    src: The source Ref. Must be in GMEM.
+    dst: The destination Ref. Must be in SMEM.
+    barrier: The barrier to use for tracking completion of the copy.
+    collective_axes: The collective axes to use for the copy.
+    partitioned_axis: Indicates which array axis along the src/dst Refs to
+     partition across during a partitioned collective copy. Requires
+     collective_axes to also be specified.
 
   See also:
     :func:`jax.experimental.mosaic.gpu.barrier_arrive`
@@ -628,6 +686,7 @@ def copy_gmem_to_smem(
       dst_transforms_treedef=dst_transforms_treedef,
       barrier_transforms_treedef=barrier_transforms_treedef,
       collective_axes=collective_axes,
+      partitioned_axis=partitioned_axis,
   )
   return None
 
@@ -651,7 +710,7 @@ def _extract_barrier_indexer(transforms) -> indexing.NDIndexer | None:
     case []:
       return None
     case _:
-      raise ValueError("Barrier does not support arbirary transforms")
+      raise ValueError("Barrier does not support arbitrary transforms")
 
 
 barrier_arrive_p = jax_core.Primitive("barrier_arrive")
@@ -835,7 +894,7 @@ def _commit_group_lowering(ctx: lowering.LoweringRuleContext):
 
 
 def commit_smem_to_gmem_group() -> None:
-  """Commits all issued but uncommited SMEM->GMEM copies to a group."""
+  """Commits all issued but uncommitted SMEM->GMEM copies to a group."""
   commit_group_p.bind()
 
 
@@ -1260,12 +1319,15 @@ def _tcgen05_mma_abstract_eval(acc, a, b, barrier, accumulate,
     raise ValueError("RHS must be an SMEM Ref.")
 
   if collective_axis is not None:
-    if not acc.collective:
+    # TODO(justinfu): If under a core_map, the avals for acc/a
+    # become normal MemRefs so we cannot check if they are collective.
+    # Figure out a way to fix this.
+    if isinstance(acc, gpu_core.AbstractTMEMRef) and not acc.collective:
       raise ValueError(
           "Accumulator Ref must be collective if collective_axis is set.")
-    if a.memory_space == gpu_core.TMEM and not a.collective:
+    if isinstance(a, gpu_core.AbstractTMEMRef) and not a.collective:
       raise ValueError(
-          "LHS TMEM Ref must be collective if collective_axis is set.")
+          "LHS Ref must be collective if collective_axis is set.")
 
   for_tensor_core = getattr(
       barrier.inner_aval.dtype, "for_tensor_core", False)
@@ -1451,6 +1513,8 @@ class Layout(enum.Enum):
   WG_STRIDED = enum.auto()
 
   TCGEN05 = enum.auto()
+  TCGEN05_ROW = enum.auto()
+  TCGEN05_COL = enum.auto()
 
   def __call__(self, *args, **kwargs) -> ParameterizedLayout:
     return ParameterizedLayout(self, args, kwargs)
@@ -1480,6 +1544,12 @@ class Layout(enum.Enum):
       case Layout.TCGEN05:
         check_no_args()
         return mgpu.TCGEN05_LAYOUT
+      case Layout.TCGEN05_ROW:
+        check_no_args()
+        return mgpu.TCGEN05_ROW_LAYOUT
+      case Layout.TCGEN05_COL:
+        check_no_args()
+        return mgpu.TCGEN05_COL_LAYOUT
 
 @dataclasses.dataclass(frozen=True)
 class ParameterizedLayout:
@@ -1796,7 +1866,7 @@ def jaxpr_call(
 
 
 @dataclasses.dataclass(frozen=True)
-class GPUShapeDtypeStruct:
+class ShapeDtypeStruct:
   shape: tuple[int, ...]
   dtype: jnp.dtype
   layout: ParameterizedLayout | Layout
@@ -1821,52 +1891,43 @@ def _undo_transforms(
   return tmp_ref.transforms
 
 
-def inline_mgpu(arg_types=(), return_type=None):
-  """Decorate a function that inlines mgpu code.
+def inline_mgpu(*, arg_types=(), return_type=None):
+  r"""Returns a decorator that inlines Mosaic GPU code.
 
-  Arguments provided to the decorated function may be Pallas
-  references or array values. The body will accept the corresponding
-  mgpu values.
+  This allows using lower-level Mosaic GPU abstractions and operations, which
+  are otherwise not directly exposed in Pallas.
 
-  The decorated function may return a tree of `FragmentedArray`s.
+  Example::
 
-  ```
-  layout = plgpu.Layout.WG_STRIDED(x_ref.shape, vec_size=4)
-  @plgpu.inline_mgpu(
-      arg_types=(plgpu.RefType(),),
-      return_type=plgpu.GPUShapeDtypeStruct(
-          (128, 128), dtype, layout=layout
-      ),
-  )
-  def foo(ctx, smem_ref):
-    del ctx
-    x = mgpu.FragmentedArray.load_tiled(smem_ref, )
-    y = mgpu.FragmentedArray.splat(
-        mgpu.c(1, x.mlir_dtype), shape=x.shape, layout=x.layout
-    )
-    return (x + y)
+      layout = plgpu.Layout.WG_STRIDED(x_ref.shape, vec_size=4)
 
-  arr = foo(smem_ref)
-  ```
+      @plgpu.inline_mgpu(
+          arg_types=(plgpu.RefType(),),
+          return_type=plgpu.ShapeDtypeStruct(
+              (128, 128), dtype, layout=layout
+          ),
+      )
+      def add_one(ctx, smem_ref):
+        x = mgpu.FragmentedArray.load_tiled(smem_ref)
+        y = mgpu.FragmentedArray.splat(
+            mgpu.c(1, x.mlir_dtype), shape=x.shape, layout=x.layout
+        )
+        return x + y
 
   Args:
-
-    arg_types: a sequence of pytrees where the leaves are `RefType` or
-      `Layout` for references or arrays respectively as the return
-      type.
-
-    return_type: A pytree where the leaves are `GPUShapeDtypeStruct`
-      represeinting the arrays returned by the decorated function.
-
-  Returns:
-    A decorator that creates a function that inlines mgpu code.
-
+    arg_types: A sequence of pytrees where the leaves are
+      {class}`~jax.experimental.pallas.mosaic_gpu.RefType`\s or
+      {class}`~jax.experimental.pallas.mosaic_gpu.Layout`\s for reference or
+      array arguments respectively.
+    return_type: A pytree where the leaves are
+      {class}`~jax.experimental.pallas.mosaic_gpu.ShapeDtypeStruct`\s
+      representing the arrays returned by the decorated function.
   """
   flat_arg_types, treedef_ty = jax.tree.flatten(tuple(arg_types))
   flat_ret_ty, pytree_ret_ty = jax.tree.flatten(return_type)
-  if return_type and not all(isinstance(r, GPUShapeDtypeStruct) for r in flat_ret_ty):
+  if return_type and not all(isinstance(r, ShapeDtypeStruct) for r in flat_ret_ty):
     raise ValueError(
-        "inline_mgpu_p only supports GPUShapeDtypeStructx return types."
+        "inline_mgpu_p only supports plgpu.ShapeDtypeStruct return types."
     )
   if not all(isinstance(r, (Layout, ParameterizedLayout, RefType)) for r in flat_arg_types):
     raise ValueError(
@@ -1951,7 +2012,7 @@ def _type_check_mgpu(v, ty):
   match (ty, v):
     case (RefType(), ir.Value()) if ir.MemRefType.isinstance(v.type):
       pass
-    case (GPUShapeDtypeStruct(), mgpu.FragmentedArray()):
+    case (ShapeDtypeStruct(), mgpu.FragmentedArray()):
       mlir_dtype = mgpu_utils.dtype_to_ir_type(ty.dtype)
       if v.mlir_dtype != mlir_dtype:
         raise ValueError(

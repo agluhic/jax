@@ -53,6 +53,8 @@ from jax._src.lax.control_flow.common import (
     _initial_style_jaxpr_attrs, _make_closed_jaxpr_attrs, _prune_zeros,
     _typecheck_param)
 from jax._src.lax.other import logaddexp
+from jax._src.pjit import auto_axes, PartitionSpec as P
+from jax._src.mesh import get_abstract_mesh
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import hlo
 from jax._src.state import discharge as state_discharge
@@ -196,7 +198,7 @@ def scan(f: Callable[[Carry, X], tuple[Carry, Y]],
       a single iteration of a loop. If an integer is provided, it determines how
       many unrolled loop iterations to run within a single rolled iteration of
       the loop. If a boolean is provided, it will determine if the loop is
-      competely unrolled (i.e. `unroll=True`) or left completely rolled (i.e.
+      completely unrolled (i.e. `unroll=True`) or left completely rolled (i.e.
       `unroll=False`).
     _split_transpose: experimental optional bool specifying whether to further
       split the transpose into a scan (computing activation gradients), and a
@@ -854,6 +856,8 @@ def _scan_partial_eval(trace, *tracers, reverse: bool,
   # want to broadcast the matrix!). So, outside the loop we perform a partial
   # evaluation with known 'const' inputs (but all other inputs unknown).
   const_pvals = [pe.PartialVal.known(t.pval.get_known())
+                 if not isinstance(t.aval, state.AbstractRef)
+                 else pe.PartialVal.unknown(t.aval)
                  for t in tracers[:num_consts] if t.pval.is_known()]
   other_pvals = [pe.PartialVal.unknown(aval)
                  for aval in jaxpr_known.in_avals[len(const_pvals):]]
@@ -898,7 +902,9 @@ def _scan_partial_eval(trace, *tracers, reverse: bool,
   # We use `fwds_known` below when forming the output of scanning jaxpr_known.
 
   # Run the known part of the scan (if it has any outputs or effects).
-  known_inputs = (list(jaxpr_known_consts) +
+  known_mutable_consts = [t.pval.get_known() for t in tracers[:num_consts]
+                          if t.pval.is_known() and isinstance(t.aval, state.AbstractRef)]
+  known_inputs = (list(jaxpr_known_consts) + known_mutable_consts +
                   [t.pval.get_known() for t in tracers[num_consts:]
                    if t.pval.is_known()])
   if not jaxpr_known.out_avals and not jaxpr_known.effects:
@@ -907,7 +913,8 @@ def _scan_partial_eval(trace, *tracers, reverse: bool,
     linear_known = [False] * len(known_inputs)  # conservative!
     out_known = scan_p.bind(
         *known_inputs, reverse=reverse, length=length, jaxpr=jaxpr_known,
-        num_consts=len(jaxpr_known_consts), num_carry=num_carry - sum(carry_uk),
+        num_consts=len(jaxpr_known_consts) + len(known_mutable_consts),
+        num_carry=num_carry - sum(carry_uk),
         linear=tuple(linear_known), unroll=unroll,
         _split_transpose=_split_transpose)
     del linear_known
@@ -1292,10 +1299,12 @@ def _scan_partial_eval_custom(saveable, unks_in, inst_in, eqn):
   num_const_known = len(const_uk) - sum(const_uk)
   num_carry_known = len(carry_uk) - sum(carry_uk)
   num_xs_known    = len(   xs_uk) - sum(   xs_uk)
+  const_donthoist = [isinstance(a, state.AbstractRef)
+                     for a in jaxpr_known.in_avals[:num_const_known]]
   jaxpr_known_hoist, jaxpr_known_loop, loop_dep, consts_known_lp_avals = \
       pe.partial_eval_jaxpr_nounits(
           jaxpr_known,
-          [False] * num_const_known + [True] * (num_carry_known + num_xs_known),
+          const_donthoist + [True] * (num_carry_known + num_xs_known),
           [True] * (len(unks_out) - sum(unks_out)) + [False] * num_res)
   # jaxpr_known_hoist produces intensive residuals followed by the constants for
   # jaxpr_known_loop. We adjust jaxpr_staged to accept intensive res as consts.
@@ -1328,10 +1337,13 @@ def _scan_partial_eval_custom(saveable, unks_in, inst_in, eqn):
                       linear=tuple(linear_known))
 
   def known(*ins_known):
-    consts_known_hoist, ins_known_lp = split_list(ins_known, [num_const_known])
+    consts_known_maybehoist, ins_known_lp = split_list(ins_known, [num_const_known])
+    consts_known_hoist, consts_known_donthoist = \
+        partition_list(const_donthoist, consts_known_maybehoist)
     out_hoist = core.jaxpr_as_fun(jaxpr_known_hoist)(*consts_known_hoist)
     intensive_res, consts_known_lp = split_list(out_hoist, [num_intensive_res])
-    out_loop = scan_p.bind(*consts_known_lp, *ins_known_lp, **params_known)
+    out_loop = scan_p.bind(*consts_known_lp, *consts_known_donthoist,
+                           *ins_known_lp, **params_known)
     return [*intensive_res, *out_loop]
   call_jaxpr_, _, call_jaxpr_consts, () = pe.trace_to_jaxpr_dynamic(
       lu.wrap_init(known, debug_info=jaxpr_known_hoist.jaxpr.debug_info),
@@ -1500,17 +1512,6 @@ def _scan_state_partial_discharge_rule(should_discharge, in_avals, out_avals, *a
   assert len(refs_out_matching_in_avals) == len(in_avals)
   return refs_out_matching_in_avals, [*carry_out, *ys]
 
-def _scan_staging(trace, *args, **params):
-  outs = trace.default_process_primitive(scan_p, args, params)
-  jaxpr = params['jaxpr']
-  trace.frame.is_high = jaxpr.jaxpr.is_high
-  invars = [trace.frame.tracer_to_var[id(t)] for t in args]
-  var_map = dict(zip(jaxpr.jaxpr.invars, invars))
-  final_env = {var_map[v]: ty for v, ty in
-               jaxpr.jaxpr.final_typechange_env.items()}
-  trace.frame.current_typechange_env.update(final_env)
-  return outs
-
 scan_p = core.Primitive("scan")
 scan_p.multiple_results = True
 scan_p.skip_canonicalization = True
@@ -1529,37 +1530,32 @@ pe.partial_eval_jaxpr_custom_rules[scan_p] = _scan_partial_eval_custom
 pe.padding_rules[scan_p] = _scan_padding_rule
 pe.dce_rules[scan_p] = _scan_dce_rule
 state_discharge.register_partial_discharge_rule(scan_p)(_scan_state_partial_discharge_rule)
-pe.custom_staging_rules[scan_p] = _scan_staging
 
 def _is_high(jaxpr, **_) -> bool:
   return jaxpr.jaxpr.is_high
 scan_p.is_high = _is_high  # type: ignore
 
 def _to_lojax(*hi_args, jaxpr, num_carry, num_consts, linear, **params):
-  ienv, fenv = jaxpr.jaxpr.initial_typechange_env, jaxpr.jaxpr.final_typechange_env
 
   # move box binders and hi_args from consts slots to carry slots
-  to_move = [t.mutable for t in jaxpr.in_avals[:num_consts]]
+  to_move = [t.has_qdd for t in jaxpr.in_aval_qdds[:num_consts]]
   jaxpr = pe.move_invars_right(jaxpr, to_move)
   hi_args = _move_right(hi_args, to_move)
   num_consts -= sum(to_move)
   num_carry += sum(to_move)
 
   # expand num_consts, num_carry, linear according to lo types
-  const_invars, carry_invars, _ = split_list(jaxpr.jaxpr.invars, [num_consts, num_carry])
-  num_consts = sum(len(v.aval.lo_ty() if not v.aval.mutable
-                       else v.aval.lo_ty_(ienv[v])) for v in const_invars)
-  num_carry = sum(len(v.aval.lo_ty() if not v.aval.mutable
-                      else v.aval.lo_ty_(ienv[v])) for v in carry_invars)
-  linear = [l for v, l_ in zip(jaxpr.jaxpr.invars, linear)
-            for l in (l_,) * len(v.aval.lo_ty() if not v.aval.mutable
-                                 else v.aval.lo_ty_(ienv[v]))]
-  lo_muts_out = sum(len(m.leaf_avals) for m in fenv.values())  # TODO hardcoded
+  const_in_avals, carry_in_avals, _ = split_list(jaxpr.in_aval_qdds, [num_consts, num_carry])
+  num_consts = sum(len(aval.lo_ty()) for aval in const_in_avals)
+  num_carry = sum(len(aval.lo_ty()) for aval in carry_in_avals)
+  linear = [l for aval, l_ in zip(jaxpr.in_aval_qdds, linear)
+            for l in (l_,) * len(aval.lo_ty())]
+  lo_muts_out = sum(len(aval.lo_ty()) for aval in jaxpr.final_aval_qdds if aval.has_qdd)
 
-  # collect lo inputs values
-  lo_args = [lo_val for v, x in zip(jaxpr.jaxpr.invars, hi_args)
-             for lo_val in (v.aval.read_loval(ienv[v], x) if v.aval.mutable
-                            else v.aval.lower_val(x))]
+  # collect lo input values
+  lo_args = [lo_val for aval, x in zip(jaxpr.in_aval_qdds, hi_args)
+             for lo_val in (aval.read_loval(x) if aval.has_qdd
+                            else aval.lower_val(x))]
 
   # lower the jaxpr and bind it using lo input values
   lo_jaxpr = pe.lower_jaxpr(jaxpr)
@@ -1570,9 +1566,13 @@ def _to_lojax(*hi_args, jaxpr, num_carry, num_consts, linear, **params):
   # collect and apply mutations
   out_mut_ = iter(out_mut)
   in_idx = {v: i for i, v in enumerate(jaxpr.jaxpr.invars)}
-  for var, ty in jaxpr.jaxpr.final_typechange_env.items():
-    lo_vals = it.islice(out_mut_, len(var.aval.lo_ty_(ty)))
-    var.aval.update_from_loval(ty, hi_args[in_idx[var]], *lo_vals)
+
+  for v in jaxpr.jaxpr.invars:
+    if v.final_qdd is not None:
+      qdd = v.final_qdd
+      lo_vals = it.islice(out_mut_, len(v.aval.lo_ty_qdd(qdd)))
+      v.aval.update_from_loval(qdd, hi_args[in_idx[v]], *lo_vals)
+
   assert next(out_mut_, None) is None
 
   # collect output values into hi types
@@ -2415,7 +2415,7 @@ def fori_loop(lower, upper, body_fun, init_val,
     unroll: An optional integer or boolean that determines how much to unroll
       the loop. If an integer is provided, it determines how many unrolled
       loop iterations to run within a single rolled iteration of the loop. If a
-      boolean is provided, it will determine if the loop is competely unrolled
+      boolean is provided, it will determine if the loop is completely unrolled
       (i.e. `unroll=True`) or left completely unrolled (i.e. `unroll=False`).
       This argument is only applicable if the loop bounds are statically known.
 
@@ -2497,21 +2497,42 @@ def fori_loop(lower, upper, body_fun, init_val,
 
 ### map and miscellaneous rules
 
+def _scan_leaf(leaf, batch_elems, num_batches, batch_size):
+  def f(l):
+    return l[:batch_elems].reshape(num_batches, batch_size, *leaf.shape[1:])
+
+  aval = core.typeof(leaf)
+  if aval.sharding.spec[0] is not None:
+    raise ValueError(
+        '0th dimension of leaf passed to `jax.lax.map` should be replicated.'
+        f' Got {aval.str_short(True, True)}')
+  if get_abstract_mesh()._are_all_axes_explicit:
+    out_s = aval.sharding.with_spec(P(None, None, *aval.sharding.spec[1:]))
+    return auto_axes(f, out_sharding=out_s)(leaf)
+  return f(leaf)
+
+def _remainder_leaf(leaf, batch_elems):
+  def f(l):
+    return l[batch_elems:]
+  if get_abstract_mesh()._are_all_axes_explicit:
+    return auto_axes(f, out_sharding=core.typeof(leaf).sharding)(leaf)
+  return f(leaf)
+
 def _batch_and_remainder(x, batch_size: int):
   leaves, treedef = tree_flatten(x)
-
-  scan_leaves = []
-  remainder_leaves = []
-
-  for leaf in leaves:
-    num_batches, _ = divmod(leaf.shape[0], batch_size)
-    total_batch_elems = num_batches * batch_size
-    scan_leaves.append(leaf[:total_batch_elems].reshape(num_batches, batch_size, *leaf.shape[1:]))
-    remainder_leaves.append(leaf[total_batch_elems:])
-
-  scan_tree = treedef.unflatten(scan_leaves)
-  remainder_tree = treedef.unflatten(remainder_leaves)
-  return scan_tree, remainder_tree
+  if not leaves:
+    return x, None
+  num_batches, remainder = divmod(leaves[0].shape[0], batch_size)
+  batch_elems = num_batches * batch_size
+  if remainder:
+    scan_leaves, remainder_leaves = unzip2(
+        [(_scan_leaf(leaf, batch_elems, num_batches, batch_size),
+          _remainder_leaf(leaf, batch_elems)) for leaf in leaves])
+    return treedef.unflatten(scan_leaves), treedef.unflatten(remainder_leaves)
+  else:
+    scan_leaves = tuple(_scan_leaf(leaf, batch_elems, num_batches, batch_size)
+                        for leaf in leaves)
+    return treedef.unflatten(scan_leaves), None
 
 @api_boundary
 def map(f, xs, *, batch_size: int | None = None):
@@ -2566,11 +2587,14 @@ def map(f, xs, *, batch_size: int | None = None):
     scan_xs, remainder_xs = _batch_and_remainder(xs, batch_size)
     g = lambda _, x: ((), api.vmap(f)(x))
     _, scan_ys = scan(g, (), scan_xs)
-    remainder_ys = api.vmap(f)(remainder_xs)
     flatten = lambda x: x.reshape(-1, *x.shape[2:])
-    ys = tree_map(
-      lambda x, y: lax.concatenate([flatten(x), y], dimension=0), scan_ys, remainder_ys,
-    )
+    if remainder_xs is not None:
+      remainder_ys = api.vmap(f)(remainder_xs)
+      ys = tree_map(
+        lambda x, y: lax.concatenate([flatten(x), y], dimension=0), scan_ys,
+        remainder_ys)
+    else:
+      ys = tree_map(flatten, scan_ys)
   else:
     g = lambda _, x: ((), f(x))
     _, ys = scan(g, (), xs)

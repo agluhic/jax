@@ -61,8 +61,8 @@ pytype_strict_library(
     name = "backend",
     srcs = ["backend.py"],
     deps = [
-        "//jax",
         "//jax:api",
+        "//jax:util",
         "//jax:xla_bridge",
     ],
 )
@@ -70,7 +70,10 @@ pytype_strict_library(
 pytype_strict_library(
     name = "random",
     srcs = ["random.py"],
-    deps = ["//jax"],
+    deps = [
+        "//jax",
+        "//jax:extend_src",
+    ],
 )
 
 pytype_strict_library(

@@ -303,7 +303,6 @@ py_library_providing_imports_info(
         "_src/checkify.py",
         "_src/custom_batching.py",
         "_src/custom_partitioning.py",
-        "_src/custom_partitioning_sharding_rule.py",
         "_src/debugging.py",
         "_src/dispatch.py",  # TODO(vanderplas): remove this and depend on :api instead
         "_src/dlpack.py",
@@ -324,7 +323,6 @@ py_library_providing_imports_info(
             "*.py",
             "_src/cudnn/**/*.py",
             "_src/debugger/**/*.py",
-            "_src/extend/**/*.py",
             "_src/image/**/*.py",
             "_src/export/**/*.py",
             "_src/lax/**/*.py",
@@ -389,6 +387,7 @@ py_library_providing_imports_info(
         ":custom_api_util",
         ":custom_dce",
         ":custom_derivatives",
+        ":custom_partitioning_sharding_rule",
         ":custom_transpose",
         ":deprecations",
         ":dtypes",
@@ -698,6 +697,14 @@ pytype_strict_library(
         ":tree_util",
         ":util",
         ":xla",
+    ],
+)
+
+pytype_strict_library(
+    name = "custom_partitioning_sharding_rule",
+    srcs = ["_src/custom_partitioning_sharding_rule.py"],
+    deps = [
+        "//jax/_src/lib",
     ],
 )
 
@@ -1106,6 +1113,10 @@ pytype_strict_library(
 pytype_strict_library(
     name = "partition_spec",
     srcs = ["_src/partition_spec.py"],
+    deps = [
+        ":util",
+        "//jax/_src/lib",
+    ],
 )
 
 pytype_strict_library(
@@ -1494,17 +1505,6 @@ pytype_library(
     deps = [":jax"],
 )
 
-# TODO(apaszke): Remove this target
-pytype_library(
-    name = "pjit",
-    srcs = ["experimental/pjit.py"],
-    visibility = ["//visibility:public"],
-    deps = [
-        ":experimental",
-        ":jax",
-    ],
-)
-
 pytype_library(
     name = "jet",
     srcs = ["experimental/jet.py"],
@@ -1542,6 +1542,12 @@ pytype_library(
     deps = [
         ":internal_mesh_utils",
     ],
+)
+
+pytype_strict_library(
+    name = "extend_src",
+    srcs = glob(include = ["_src/extend/**/*.py"]),
+    deps = [":jax"],
 )
 
 # TODO(phawkins): remove this target in favor of the finer-grained targets in jax/extend/...

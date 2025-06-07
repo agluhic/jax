@@ -1136,6 +1136,7 @@ jax_multiplatform_test(
     enable_backends = [
         "cpu",
         "gpu",
+        "tpu",
     ],
     deps = [
         "//jax:profiler",
@@ -2038,10 +2039,9 @@ jax_multiplatform_test(
 jax_multiplatform_test(
     name = "export_back_compat_test",
     srcs = ["export_back_compat_test.py"],
-    # TODO(b/415285434): enable once we have backwards compatibility support with GSPMD checkpoints.
-    # enable_configs = [
-    #     "tpu_v3_x4_shardy",
-    # ],
+    enable_configs = [
+        "tpu_v3_x4_shardy",
+    ],
     tags = [],
     deps = [
         "//jax:internal_export_back_compat_test_data",
@@ -2157,6 +2157,7 @@ jax_py_test(
     srcs = ["custom_partitioning_sharding_rule_test.py"],
     deps = [
         "//jax",
+        "//jax:custom_partitioning_sharding_rule",
         "//jax:experimental",
         "//jax:test_util",
     ] + py_deps("absl/testing"),

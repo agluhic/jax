@@ -21,6 +21,7 @@ contains only tests that do not use shard_map.
 from collections.abc import Callable
 import dataclasses
 import functools
+import threading
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -91,7 +92,7 @@ class GridPointRecorderContext(object):
 
   @property
   def grid_points(self) -> list[ProcessedGridPoint]:
-    return self._grid_points
+    return sorted(self._grid_points, key=lambda x: x.core_id)
 
 
 # TODO(jburnim): Figure out how to safely run different instance of TPU
@@ -124,7 +125,7 @@ class InterpretTest(jtu.JaxTestCase):
               (x.shape[0] // 2, y.shape[1] // 2),
               lambda i, j: (i, j),
           ),
-          interpret=pltpu.TPUInterpretParams(),
+          interpret=pltpu.InterpretParams(),
       )(x, y)
 
     k1, k2 = jax.random.split(jax.random.key(0))
@@ -155,7 +156,7 @@ class InterpretTest(jtu.JaxTestCase):
           dynamic_slice_kernel,
           grid_spec=grid_spec,
           out_shape=jax.ShapeDtypeStruct(shape=sizes, dtype=x.dtype),
-          interpret=pltpu.TPUInterpretParams(),
+          interpret=pltpu.InterpretParams(),
       )
       block_idx = jnp.array([starts[0] // sizes[0], starts[1] // sizes[1]])
       return kernel(block_idx, x)
@@ -189,7 +190,7 @@ class InterpretTest(jtu.JaxTestCase):
           ],
           out_specs=pl.BlockSpec(x.shape, lambda i: (0, 0)),
           input_output_aliases={1: 0},
-          interpret=pltpu.TPUInterpretParams(),
+          interpret=pltpu.InterpretParams(),
       )(s, x)
 
     s = jnp.array([1], dtype=jnp.int32)
@@ -224,7 +225,7 @@ class InterpretTest(jtu.JaxTestCase):
         ),
         scratch_shapes=(pltpu.SMEM((1,), jnp.int32),),
         input_output_aliases={0: 0},
-        interpret=pltpu.TPUInterpretParams(),
+        interpret=pltpu.InterpretParams(),
     )(x)
 
     expected = np.zeros((4, 4))
@@ -264,7 +265,7 @@ class InterpretTest(jtu.JaxTestCase):
             pltpu.VMEM(x.shape, x.dtype),
             pltpu.SemaphoreType.DMA,
         ],
-        interpret=pltpu.TPUInterpretParams(
+        interpret=pltpu.InterpretParams(
             detect_races=True, dma_execution_mode=dma_execution_mode
         ),
     )(x).block_until_ready()
@@ -279,7 +280,7 @@ class InterpretTest(jtu.JaxTestCase):
             pltpu.VMEM(x.shape, x.dtype),
             pltpu.SemaphoreType.DMA,
         ],
-        interpret=pltpu.TPUInterpretParams(
+        interpret=pltpu.InterpretParams(
             detect_races=True, dma_execution_mode=dma_execution_mode
         ),
     )(x).block_until_ready()
@@ -293,7 +294,7 @@ class InterpretTest(jtu.JaxTestCase):
       return pl.pallas_call(
           matmul_kernel,
           out_shape=jax.ShapeDtypeStruct((x.shape[0], y.shape[1]), x.dtype),
-          interpret=pltpu.TPUInterpretParams(
+          interpret=pltpu.InterpretParams(
               skip_floating_point_ops=True
           ),
       )(x, y)
@@ -325,7 +326,7 @@ class InterpretTest(jtu.JaxTestCase):
             pltpu.VMEM((8, 128), jnp.bfloat16),
             pltpu.VMEM((8, 128), jnp.int16),
         ],
-        interpret=pltpu.TPUInterpretParams(
+        interpret=pltpu.InterpretParams(
             uninitialized_memory=uninitialized_memory
         ),
     )()
@@ -355,7 +356,7 @@ class InterpretTest(jtu.JaxTestCase):
               pl.BlockSpec(memory_space=pltpu.SMEM),
           ],
           out_specs=pl.BlockSpec((8, 256), lambda i, j: (i, 0)),
-          interpret=pltpu.TPUInterpretParams(),
+          interpret=pltpu.InterpretParams(),
       )(x, s)
 
     with CountStoreCallbacksContext() as store_callbacks_counter:
@@ -378,10 +379,10 @@ class InterpretTest(jtu.JaxTestCase):
           grid=(4, 4),
           in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)],
           out_specs=pl.BlockSpec((8, 128), lambda i, j: (i, j)),
-          interpret=pltpu.TPUInterpretParams(
+          interpret=pltpu.InterpretParams(
               random_seed=12345, grid_point_recorder=grid_point_recorder
           ),
-          compiler_params=pltpu.TPUCompilerParams(
+          compiler_params=pltpu.CompilerParams(
               dimension_semantics=('parallel', 'arbitrary')
           ),
       )(s)
@@ -436,8 +437,8 @@ class InterpretTest(jtu.JaxTestCase):
           grid=(4, 4),
           in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)],
           out_specs=pl.BlockSpec((8, 128), lambda i, j: (i, j)),
-          interpret=pltpu.TPUInterpretParams(random_seed=12345),
-          compiler_params=pltpu.TPUCompilerParams(
+          interpret=pltpu.InterpretParams(random_seed=12345),
+          compiler_params=pltpu.CompilerParams(
               dimension_semantics=('arbitrary', 'parallel')
           ),
       )(s)
@@ -462,8 +463,8 @@ class InterpretTest(jtu.JaxTestCase):
           grid=(dim_size,),
           in_specs=[],
           out_specs=pl.BlockSpec((1,), lambda _: (0,)),
-          interpret=pltpu.TPUInterpretParams(),
-          compiler_params=pltpu.TPUCompilerParams(
+          interpret=pltpu.InterpretParams(),
+          compiler_params=pltpu.CompilerParams(
               dimension_semantics=('parallel',)
           ),
       )()
@@ -471,40 +472,52 @@ class InterpretTest(jtu.JaxTestCase):
     with self.assertRaises(jax.errors.ConcretizationTypeError):
       kernel_call_dynamic_parallel_dimension()
 
-  def test_core_map_over_one_core(self):
-    mesh = pltpu.create_tensorcore_mesh("x", num_cores=1)
+  @parameterized.parameters(1, 2, 4)
+  def test_core_map(self, num_cores):
+    mesh = pltpu.create_tensorcore_mesh('x', num_cores=num_cores)
+    interpret = pltpu.InterpretParams()
 
     @jax.jit
     def f(x):
       y = jnp.zeros_like(x)
       def inner(refs):
         x_ref, y_ref = refs
-        @pl.core_map(mesh, interpret=pltpu.TPUInterpretParams())
+        @pl.core_map(mesh, interpret=interpret)
         def _():
-          num_cores = jax.lax.psum(1, "x")
+          num_cores = jax.lax.axis_size('x')
           slc_size = 16 // num_cores
-          def alloc(x_vmem_ref, y_vmem_ref, sem):
-            core_index = jax.lax.axis_index("x")
+          def alloc(x_vmem_ref, y_vmem_ref, dma_sem, sem):
+            # Barrier so we deadlock unless the core_map is actually parallel.
+            for i in range(num_cores):
+              pl.semaphore_signal(sem, 1, core_index=i)
+            pl.semaphore_wait(sem, num_cores)
+
+            core_index = jax.lax.axis_index('x')
             slc = pl.ds(core_index * slc_size, slc_size)
             pltpu.async_copy(
                 x_ref.at[slc],
                 x_vmem_ref,
-                sem,
+                dma_sem,
             ).wait()
-            y = x_vmem_ref[...] + 1 + jax.lax.axis_index("x")
+            y = x_vmem_ref[...] + jax.lax.axis_index('x') + 1
             y_vmem_ref[...] = y
-            pltpu.async_copy(y_vmem_ref, y_ref.at[slc], sem).wait()
+            pltpu.async_copy(y_vmem_ref, y_ref.at[slc], dma_sem).wait()
           pl.run_scoped(
               alloc,
               pltpu.VMEM((slc_size, 128), x_ref.dtype),
               pltpu.VMEM((slc_size, 128), y_ref.dtype),
               pltpu.SemaphoreType.DMA,
+              pltpu.SemaphoreType.REGULAR,
           )
       _, y = pl.run_state(inner)((x, y))
       return y
     x = jnp.arange(16 * 128, dtype=jnp.int32).reshape((16, 128))
+    expected_out = (
+        x.reshape((num_cores, -1, 128)) + 1
+        + jnp.arange(num_cores, dtype=jnp.int32)[..., None, None]
+    ).reshape(x.shape)
     y = f(x)
-    np.testing.assert_array_equal(y, x + 1)
+    np.testing.assert_array_equal(y, expected_out)
 
   def test_two_cores_along_parallel_dimension_with_race(self):
     def kernel(x_ref, o_ref, vmem_ref):
@@ -516,15 +529,15 @@ class InterpretTest(jtu.JaxTestCase):
         kernel,
         grid=(2,),
         out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-        in_specs=[pl.BlockSpec(memory_space=pltpu.TPUMemorySpace.ANY)],
+        in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY)],
         scratch_shapes=[
             pltpu.VMEM(x.shape, x.dtype),
         ],
-        interpret=pltpu.TPUInterpretParams(
+        interpret=pltpu.InterpretParams(
             num_cores_per_device=2,
             detect_races=True,
         ),
-        compiler_params=pltpu.TPUCompilerParams(
+        compiler_params=pltpu.CompilerParams(
             dimension_semantics=('parallel',),
         ),
     )(x).block_until_ready()
@@ -554,11 +567,11 @@ class InterpretTest(jtu.JaxTestCase):
         scratch_shapes=[
             pltpu.VMEM((8, 128), x.dtype),
         ],
-        interpret=pltpu.TPUInterpretParams(
+        interpret=pltpu.InterpretParams(
             num_cores_per_device=2,
             detect_races=True,
         ),
-        compiler_params=pltpu.TPUCompilerParams(
+        compiler_params=pltpu.CompilerParams(
             dimension_semantics=('parallel',)
         ),
     )(x).block_until_ready()
@@ -566,32 +579,43 @@ class InterpretTest(jtu.JaxTestCase):
     np.testing.assert_allclose(y, 2.0 * x)
 
   def test_parallel_dimension_and_multiple_cores(self):
-    def kernel(s_ref, o_ref):
+    def kernel(s_ref, in_ref, o_ref):
+      # NOTE: diff should be 0.
+      diff = in_ref[...] - jnp.float32(4 * pl.program_id(0) + pl.program_id(1))
+
       s = s_ref[0]
       s_ref[0] = s + 1
-      o_ref[:] = jax.lax.full_like(o_ref, s)
+      o_ref[:] = jax.lax.full_like(o_ref, s) + diff
 
     def kernel_call(s, num_cores_per_device, grid_point_recorder):
+      block_input = jnp.repeat(
+          jnp.repeat(
+              jnp.arange(16, dtype=jnp.float32).reshape((4, 4)), 128, axis=1),
+          8, axis=0)
       return pl.pallas_call(
           kernel,
           out_shape=jax.ShapeDtypeStruct((32, 512), jnp.float32),
           grid=(4, 4),
-          in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)],
+          in_specs=[
+              pl.BlockSpec(memory_space=pltpu.SMEM),
+              pl.BlockSpec((8, 128), lambda i, j: (i, j)),
+          ],
           out_specs=pl.BlockSpec((8, 128), lambda i, j: (i, j)),
-          interpret=pltpu.TPUInterpretParams(
+          interpret=pltpu.InterpretParams(
               random_seed=12345,
               num_cores_per_device=num_cores_per_device,
               grid_point_recorder=grid_point_recorder,
+              detect_races=True,
           ),
-          compiler_params=pltpu.TPUCompilerParams(
+          compiler_params=pltpu.CompilerParams(
               dimension_semantics=('parallel', 'arbitrary')
           ),
-      )(s)
+      )(s, block_input)
 
     with self.subTest('num_cores_per_device=1'):
       with GridPointRecorderContext() as grid_point_recorder:
         result = jax.jit(kernel_call, static_argnums=(1, 2))(
-            jnp.zeros((1,), jnp.int32), 1, grid_point_recorder.get_recorder()
+            jnp.zeros((1,), jnp.float32), 1, grid_point_recorder.get_recorder()
         )
         np.testing.assert_allclose(
             result[::8, ::128],
@@ -630,7 +654,7 @@ class InterpretTest(jtu.JaxTestCase):
     with self.subTest('num_cores_per_device=2'):
       with GridPointRecorderContext() as grid_point_recorder:
         result = jax.jit(kernel_call, static_argnums=(1, 2))(
-            jnp.zeros((1,), jnp.int32), 2, grid_point_recorder.get_recorder()
+            jnp.zeros((1,), jnp.float32), 2, grid_point_recorder.get_recorder()
         )
         np.testing.assert_allclose(
             result[::8, ::128],
@@ -669,7 +693,7 @@ class InterpretTest(jtu.JaxTestCase):
     with self.subTest('num_cores_per_device=3'):
       with GridPointRecorderContext() as grid_point_recorder:
         result = jax.jit(kernel_call, static_argnums=(1, 2))(
-            jnp.zeros((1,), jnp.int32), 3, grid_point_recorder.get_recorder()
+            jnp.zeros((1,), jnp.float32), 3, grid_point_recorder.get_recorder()
         )
         np.testing.assert_allclose(
             result[::8, ::128],
@@ -708,7 +732,7 @@ class InterpretTest(jtu.JaxTestCase):
     with self.subTest('num_cores_per_device=4'):
       with GridPointRecorderContext() as grid_point_recorder:
         result = jax.jit(kernel_call, static_argnums=(1, 2))(
-            jnp.zeros((1,), jnp.int32), 4, grid_point_recorder.get_recorder()
+            jnp.zeros((1,), jnp.float32), 4, grid_point_recorder.get_recorder()
         )
         np.testing.assert_allclose(
             result[::8, ::128],
@@ -747,7 +771,7 @@ class InterpretTest(jtu.JaxTestCase):
     with self.subTest('num_cores_per_device=5'):
       with GridPointRecorderContext() as grid_point_recorder:
         result = jax.jit(kernel_call, static_argnums=(1, 2))(
-            jnp.zeros((1,), jnp.int32), 5, grid_point_recorder.get_recorder()
+            jnp.zeros((1,), jnp.float32), 5, grid_point_recorder.get_recorder()
         )
         np.testing.assert_allclose(
             result[::8, ::128],
@@ -786,7 +810,7 @@ class InterpretTest(jtu.JaxTestCase):
     with self.subTest('num_cores_per_device=6'):
       with GridPointRecorderContext() as grid_point_recorder:
         result = jax.jit(kernel_call, static_argnums=(1, 2))(
-            jnp.zeros((1,), jnp.int32), 6, grid_point_recorder.get_recorder()
+            jnp.zeros((1,), jnp.float32), 6, grid_point_recorder.get_recorder()
         )
         np.testing.assert_allclose(
             result[::8, ::128],
@@ -821,6 +845,28 @@ class InterpretTest(jtu.JaxTestCase):
                 ProcessedGridPoint((1, 3), 3),
             ],
         )
+
+  def test_thread_map(self):
+    barrier = threading.Barrier(8)
+    lock = threading.Lock()
+    concurrent_calls = [0]
+    max_concurrent_calls = [0]
+
+    def _barrier():
+      with lock:
+        concurrent_calls[0] += 1
+        max_concurrent_calls[0] = max(
+            max_concurrent_calls[0], concurrent_calls[0])
+      barrier.wait()
+      with lock:
+        concurrent_calls[0] -= 1
+
+    def f(core_index):
+      del core_index
+      jax.experimental.io_callback(_barrier, (), ordered=True)
+
+    mosaic_interpret._thread_map(f, 8)
+    self.assertEqual(max_concurrent_calls[0], 8)
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

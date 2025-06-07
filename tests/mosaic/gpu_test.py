@@ -508,6 +508,40 @@ class WGMMALayoutTest(TestCase):
     np.testing.assert_array_equal(iota, expected)
 
   @parameterized.product(
+      dtype=[jnp.float8_e5m2fnuz, jnp.float8_e5m2, jnp.float8_e4m3b11fnuz,
+             jnp.float8_e4m3fn, jnp.float8_e4m3fnuz],
+      swizzle=(32, 64, 128),
+      num_col_tiles=(1, 2, 3),
+  )
+  def test_load_and_store_tiled_f8(self, dtype, swizzle, num_col_tiles):
+    # We use a different test than `test_store_tiled` because converting
+    # `iota` to `f8` type requires additional specialized logic that is not
+    # yet available.
+    col_tiling = swizzle
+    m = 128
+    n = col_tiling * num_col_tiles
+    tiling = (64, col_tiling)
+    def kernel(ctx, inp, out, smem):
+      del ctx
+      smem_inp, smem_out = smem
+      copy(inp, smem_inp, swizzle=swizzle)
+      arr = mgpu.FragmentedArray.load_tiled(smem_inp, swizzle=swizzle)
+      arr.store_tiled(smem_out, swizzle=swizzle)
+      copy(smem_out, out, swizzle=swizzle)
+    expected = (
+        jax.random.randint(
+            jax.random.key(42), (m * n,), -16, 15, dtype=jnp.int8
+        )
+        .reshape(m // tiling[0], tiling[0], n // tiling[1], tiling[1])
+        .astype(dtype)
+        .transpose(0, 2, 1, 3)
+    )
+    res = mgpu.as_gpu_kernel(
+        kernel, (1, 1, 1), (128, 1, 1), expected, expected, (expected,) * 2
+    )(expected)
+    np.testing.assert_array_equal(res, expected)
+
+  @parameterized.product(
       dtype=[jnp.float32, jnp.float16, jnp.int8],
       swizzle=(32, 64, 128),
       num_col_tiles=(1, 2, 3),
@@ -552,6 +586,56 @@ class WGMMALayoutTest(TestCase):
     y = x.astype(jax_dtype_to)
     f = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), x, y, (x, y))
     np.testing.assert_array_equal(f(x), y)
+
+  @parameterized.parameters(
+      (jnp.float32, jnp.float8_e4m3fn),
+      (jnp.bfloat16, jnp.float8_e4m3fn)
+  )
+  def test_f8_conversions(self, jax_dtype_from, jax_dtype_to):
+    mlir_dtype_to = utils.dtype_to_ir_type(jax_dtype_to)
+    def kernel(ctx, inp, out, smem):
+      del ctx
+      smem_from, smem_to = smem
+      copy(inp, smem_from, swizzle=128)
+      t = mgpu.FragmentedArray.load_tiled(
+          smem_from,
+          swizzle=128,
+          is_signed=None,
+          layout=fa.WGMMA_LAYOUT,
+      )
+      t = t.astype(mlir_dtype_to, is_signed=utils.is_signed(jax_dtype_to))
+      t.store_tiled(smem_to, swizzle=128)
+      copy(smem_to, out, swizzle=128)
+
+    # These generative shenanigans are to ensure that we don't generate values
+    # that are too large for the target type. That is because the saturation
+    # behavior of the conversion is different between XLA and Mosaic GPU here
+    # (to use the NVIDIA internal, we allow Mosaic GPU to use the .satfinite
+    # modifier, which saturates to the largest finite value---while XLA would
+    # give us NaNs in this case).
+    max_finite_val = 0b111_1110
+
+    expected = jax.lax.bitcast_convert_type(
+        jax.random.randint(
+            jax.random.key(42),
+            (1, 1, 64, 128),
+            -max_finite_val,
+            max_finite_val + 1,
+            dtype=jnp.uint8,
+        ),
+        jax_dtype_to,
+    )
+    x = expected.astype(jax_dtype_from)
+
+    res = mgpu.as_gpu_kernel(
+        kernel,
+        (1, 1, 1),
+        (128, 1, 1),
+        x,
+        expected,
+        (x, expected),
+    )(x)
+    np.testing.assert_array_equal(res, expected)
 
   @parameterized.product(
       jax_dtype_from_to=(
@@ -2208,6 +2292,20 @@ class FragmentedArrayTest(TestCase):
     result = m * n if reduce_both else n
     np.testing.assert_array_equal(kernel_fn(), jnp.full((m,), result, dtype))
 
+  @parameterized.named_parameters(
+      ("wgmma_row", fa.WGMMA_LAYOUT, fa.WGMMA_ROW_LAYOUT, 1),
+      ("wgmma_col", fa.WGMMA_LAYOUT, fa.WGMMA_COL_LAYOUT, 0),
+      ("tcgen05_row", tcgen05.LAYOUT, tcgen05.ROW_LAYOUT, 1),
+      ("tcgen05_col", tcgen05.LAYOUT, tcgen05.COL_LAYOUT, 0),
+  )
+  def test_layout_reduction_definition(self, layout, expected_reduced_layout, axis):
+    def squeeze_shape(shape):
+      return tuple(s for s in shape if s != 1)
+    reduced_layout = layout.reduce((axis,))
+    tiled_shape = squeeze_shape(reduced_layout.tiled_tiling_shape)
+    expected_tiled_shape = squeeze_shape(expected_reduced_layout.tiled_tiling_shape)
+    self.assertEqual(tiled_shape, expected_tiled_shape)
+
   @parameterized.product(
       op=(arith.addf, arith.maximumf),
       m=(64, 128),
@@ -3651,20 +3749,22 @@ if hp is not None:
         shape, layout = draw(shape_and_tiled_layout(vector_transfer=True))
         rank = len(shape)
         reduced_dims = draw(hps.sets(hps.integers(0, rank - 1), min_size=1))
-        return shape, layout, tuple(reduced_dims)
+        dtype = draw(hps.sampled_from([jnp.float32, jnp.bfloat16]))
+        return shape, layout, tuple(reduced_dims), dtype
 
       @hp.given(strategy())
       def run(args):
-        shape, layout, reduced_dims = args
+        shape, layout, reduced_dims, dtype = args
         out_shape = list(shape)
         for d in sorted(reduced_dims, reverse=True):
           del out_shape[d]
         def kernel(ctx, src, dst, scratch):
+          del ctx
           arr = fa.FragmentedArray.load_untiled(src, layout=layout, optimized=False)
           arr.reduce("max", reduced_dims, scratch).store_untiled(dst, optimized=False)
-        x = jax.random.normal(jax.random.key(1234), shape, jnp.float32)
-        out_type = jax.ShapeDtypeStruct(out_shape, jnp.float32)
-        scratch_type = jax.ShapeDtypeStruct((2048,), jnp.float32)
+        x = jax.random.normal(jax.random.key(1234), shape, dtype)
+        out_type = jax.ShapeDtypeStruct(out_shape, dtype)
+        scratch_type = jax.ShapeDtypeStruct((2048,), dtype)
         hp.assume(layout.vector_length <= 16)  # Otherwise we run out of scratch
         try:
           result = mgpu.as_gpu_kernel(

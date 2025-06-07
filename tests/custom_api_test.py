@@ -2954,7 +2954,7 @@ class CustomVJPTest(jtu.JaxTestCase):
       return np.array([1.0])*x
 
     def fwd(x):
-      return np.array([2.0])*x*x/np.array([1.0]), (x,)
+      return np.array([2.0])*x*x/np.array([1.0]), (2 * x,)
 
     x = jnp.linspace(0, 5.0, 10)
     fwd = custom_derivatives.optimize_remat_of_custom_vjp_fwd(
@@ -2968,7 +2968,7 @@ class CustomVJPTest(jtu.JaxTestCase):
     def fun(x):
       return (np.array([1.0])*x)[0]
     def fwd(x):
-      return (np.array([2.0])*x*x/np.array([1.0]))[0], (x,)
+      return (np.array([2.0])*x*x/np.array([1.0]))[0], (2 * x,)
     x = jnp.linspace(0, 5.0, 10)
     fwd = custom_derivatives.optimize_remat_of_custom_vjp_fwd(
         fun, api_util.debug_info("custom_vjp fun", fun, (x,), {}),
@@ -2980,7 +2980,7 @@ class CustomVJPTest(jtu.JaxTestCase):
     def fun(x):
       return x
     def fwd(x):
-      return x*x, (x,)
+      return x*x, (2 * x,)
 
     x = jnp.linspace(0, 5.0, 10)
     fwd = custom_derivatives.optimize_remat_of_custom_vjp_fwd(
@@ -2997,7 +2997,7 @@ class CustomVJPTest(jtu.JaxTestCase):
     def fun(x):
       return x**2
     def fwd_(x):
-      return x*x, (x,)
+      return x*x, (2 * x,)
 
     fwd = custom_derivatives.optimize_remat_of_custom_vjp_fwd(
         fun, api_util.debug_info("custom_vjp fun", fun, (3.2,), {}),
@@ -3193,6 +3193,35 @@ class CustomVJPTest(jtu.JaxTestCase):
               bwd=f_bwd
               call_jaxpr={ lambda ; c:f32[1]. let d:f32[1] = add c 1.0:f32[] in (d,) }
               fwd=f_fwd
+              symbolic_zeros=False
+            ] a
+          in (b,) }
+        """).strip()
+    self.assertEqual(actual, expected)
+
+  def test_custom_lin_pretty_print(self):
+    @jax.custom_vjp
+    def f(x):
+      return x + 1
+
+    def f_fwd(x):
+      return f(x), ()
+
+    def f_bwd(_, g):
+      return g
+    f.defvjp(f_fwd, f_bwd)
+
+    x = jnp.array([4.2], dtype=jnp.float32)
+    jaxpr = jax.make_jaxpr(lambda x: jax.jvp(f, (x,), (x,)))(x)
+    jaxpr, _ = pe.dce_jaxpr(jaxpr.jaxpr, [False, True])
+    actual = jaxpr.pretty_print(use_color=False)
+    expected = textwrap.dedent(
+        """
+        { lambda ; a:f32[1]. let
+            b:f32[1] = custom_lin[
+              bwd=f_bwd
+              in_zeros=[False]
+              num_res=0
               symbolic_zeros=False
             ] a
           in (b,) }

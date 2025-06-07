@@ -558,6 +558,7 @@ jax_multiplatform_test(
     disable_configs = ["cpu_shardy"],
     enable_backends = ["cpu"],
     deps = [
+        "//jax:experimental",
         "//jax:pallas",
         "//jax:pallas_tpu",
     ] + py_deps([
@@ -809,12 +810,35 @@ jax_multiplatform_test(
     name = "mgpu_matmul_test",
     srcs = ["mgpu_matmul_test.py"],
     enable_backends = [],
-    enable_configs = [],  # TODO(justinfu): Enable B200 when available.
+    enable_configs = ["gpu_b200"],
     env = {"XLA_FLAGS": "--xla_gpu_autotune_level=0"},
     shard_count = 8,
+    tags = [
+        # TODO(b/330364373): Remove when B200 is fully supported.
+        "notap",
+    ],
     deps = [
         "//jax:pallas",
         "//jax:pallas_experimental_gpu_ops",
+        "//jax:pallas_mosaic_gpu",
+    ] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
+    name = "blackwell_matmul_mgpu_run",
+    srcs = ["//jax/experimental/pallas/ops/gpu:blackwell_matmul_mgpu.py"],
+    enable_backends = [],
+    enable_configs = ["gpu_b200"],
+    env = {"XLA_FLAGS": "--xla_gpu_autotune_level=0"},
+    tags = [
+        "manual",
+        "notap",
+    ],
+    deps = [
+        "//jax:pallas",
         "//jax:pallas_mosaic_gpu",
     ] + py_deps([
         "absl/testing",

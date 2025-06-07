@@ -638,7 +638,7 @@ def ragged_paged_attention_kernel(
             v = v.astype(q_ref.dtype)
           kv_head_idx = kv_head_chunk_idx + step_idx
           q_head_idx = kv_head_idx * num_q_heads_per_kv_head
-          # TODO(jevinjiang): extra handlig for packed type that can start at
+          # TODO(jevinjiang): extra handling for packed type that can start at
           # unaligned position!
           q = fold_on_2nd_minor(
               q_ref[:, q_head_idx : q_head_idx + num_q_heads_per_kv_head, :]
@@ -891,7 +891,7 @@ def ragged_paged_attention(
           grid=grid,
           scratch_shapes=scratch_shapes,
       ),
-      compiler_params=pltpu.TPUCompilerParams(
+      compiler_params=pltpu.CompilerParams(
           dimension_semantics=(
               "arbitrary",
               "arbitrary",
